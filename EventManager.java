@@ -6,52 +6,66 @@ import java.lang.reflect.Type;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 public class EventManager {
 
     public interface EventListener<T extends Event> {
         void onEvent(T event);
-        default int getPriority() {
+         default int getPriority() {
             return 0;
         }
     }
 
-    private final ConcurrentHashMap<Type, PriorityQueue<EventListener<?>>> listenerMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Type, CopyOnWriteArrayList<EventListener<?>>> listenerMap = new ConcurrentHashMap<>();
     private final Map<Class<?>, Field[]> declaredFieldsCache = new HashMap<>();
+
+    private final Comparator<EventListener<?>> priorityOrder = Comparator.comparingInt((EventListener<?> listener) -> listener.getPriority()).reversed();
+    private final BiConsumer<List<EventListener<?>>, Comparator<EventListener<?>>> sortCallback = List::sort;
+    private final Consumer<Throwable> errorHandler = Throwable::printStackTrace;
 
     private Field[] getCachedDeclaredFields(final Class<?> clazz) {
         return declaredFieldsCache.computeIfAbsent(clazz, Class::getDeclaredFields);
     }
 
     public void subscribe(final Object o) {
-        modifyEventListenerState(o, (type, listener) ->
-                listenerMap.computeIfAbsent(type, k -> new PriorityQueue<>(Comparator.comparingInt((EventListener<?> eventListener) -> eventListener.getPriority()).reversed())).add(listener));
-
+        modifyEventListenerState(o, (type, listener) -> {
+            listenerMap.computeIfAbsent(type, k -> new CopyOnWriteArrayList<>()).add(listener);
+            sortCallback.accept(listenerMap.get(type), priorityOrder);
+        });
     }
 
     public <T extends Event> void triggerEvent(T event) {
         Type eventType = event.getClass();
-        PriorityQueue<EventListener<?>> listeners = listenerMap.get(eventType);
+        CopyOnWriteArrayList<EventListener<?>> listeners = listenerMap.get(eventType);
 
         if (listeners != null) {
             for (EventListener<?> listener : listeners) {
-                @SuppressWarnings("unchecked")
-                EventListener<T> castedListener = (EventListener<T>) listener;
-                castedListener.onEvent(event);
+                try {
+                    @SuppressWarnings("unchecked")
+                    EventListener<T> castedListener = (EventListener<T>) listener;
+                    castedListener.onEvent(event);
+                } catch (Throwable t) {
+                    errorHandler.accept(t);
+                }
             }
         }
     }
 
-
     public void unsubscribe(final Object o) {
-        modifyEventListenerState(o, (type, listener) ->
-                listenerMap.computeIfPresent(type, (k, v) -> {
-                    v.remove(listener);
-                    return v.isEmpty() ? null : v;
-                }));
+        modifyEventListenerState(o, (type, listener) -> {
+            CopyOnWriteArrayList<EventListener<?>> listeners = listenerMap.get(type);
+            if (listeners != null) {
+                listeners.remove(listener);
+                if (listeners.isEmpty()) {
+                    listenerMap.remove(type);
+                }
+            }
+        });
     }
 
     private void modifyEventListenerState(final Object o, final BiConsumer<Type, EventListener<?>> eventListenerBiConsumer) {
